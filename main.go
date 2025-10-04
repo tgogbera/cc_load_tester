@@ -10,17 +10,22 @@ import (
 
 func main() {
 	n := flag.Int("n", 0, "number value")
+	u := flag.String("u", "", "url value")
 
 	flag.Parse()
 
-	args := flag.Args()
-	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: ccload <url>")
-		os.Exit(2)
+	url := *u
+	if url == "" {
+		fmt.Fprintln(os.Stderr, "URL is required")
+		os.Exit(1)
+	}
+
+	if *n <= 0 {
+		fmt.Fprintln(os.Stderr, "Number of requests must be greater than 0")
+		os.Exit(1)
 	}
 
 	var wg sync.WaitGroup
-	url := args[0]
 
 	print("Starting load test...\n")
 

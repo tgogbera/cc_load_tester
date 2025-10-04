@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
 )
 
 func main() {
-	// Use the flag package only to allow future extensions; parse any flags first
+	n := flag.Int("n", 0, "number value")
+
 	flag.Parse()
 
 	args := flag.Args()
@@ -17,14 +19,21 @@ func main() {
 		os.Exit(2)
 	}
 
+	var wg sync.WaitGroup
 	url := args[0]
 
-	resp, err := http.Get(url)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Request error: %v\n", err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
+	print("Starting load test...\n")
 
-	fmt.Printf("Response code: %d\n", resp.StatusCode)
+	for i := 0; i < *n; i++ {
+		wg.Go(func() {
+			resp, err := http.Get(url)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Request error: %v\n", err)
+				return
+			}
+			defer resp.Body.Close()
+			fmt.Printf("Response code: %d\n", resp.StatusCode)
+		})
+	}
+	wg.Wait()
 }

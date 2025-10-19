@@ -1,241 +1,252 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sync"
 	"time"
 )
 
-type Metrics struct {
-	requestTime     float64
-	timeToFirstByte float64
-	timeToLastByte  float64
+// Metric holds the results for a single successful request.
+type Metric struct {
+	timeToFirstByte time.Duration
+	timeToLastByte  time.Duration // This is the total request time
+	statusCode      int
 }
 
 func main() {
-	n := flag.Int("n", 0, "number value")
-	u := flag.String("u", "", "url value")
-	c := flag.Int("c", 0, "concurent requests value")
-
+	// --- Step 1, 2, 3, 6: Flag Parsing ---
+	urlFlag := flag.String("u", "", "URL to test")
+	numReqsFlag := flag.Int("n", 0, "Number of requests")
+	concurrencyFlag := flag.Int("c", 0, "Number of concurrent requests")
+	fileFlag := flag.String("f", "", "File containing URLs to test")
 	flag.Parse()
 
-	url := *u
-	if url == "" {
-		fmt.Fprintln(os.Stderr, "URL is required")
-		os.Exit(1)
+	// --- Input Validation and URL Loading ---
+	urls, err := getURLs(*fileFlag, *urlFlag, flag.Args())
+	if err != nil {
+		log.Fatalf("Error: %v", err)
 	}
 
-	if *n <= 0 {
-		fmt.Fprintln(os.Stderr, "Number of requests must be greater than 0")
-		os.Exit(1)
+	numRequests := *numReqsFlag
+	concurrency := *concurrencyFlag
+
+	// --- Logic for Step 1 ---
+	// If n and c are not set, and we got a bare URL, run as Step 1 (n=1, c=1)
+	isStep1Case := *numReqsFlag == 0 && *concurrencyFlag == 0 && len(flag.Args()) > 0
+	if isStep1Case {
+		numRequests = 1
+		concurrency = 1
 	}
 
-	if *c <= 0 {
-		fmt.Fprintln(os.Stderr, "Number of concurrent requests must be greater than 0")
-		os.Exit(1)
+	if numRequests <= 0 {
+		log.Fatal("Error: Number of requests (-n) must be greater than 0")
+	}
+	if concurrency <= 0 {
+		log.Fatal("Error: Concurrency (-c) must be greater than 0")
 	}
 
-	successCount := 0
-	failureCount := 0
+	// Sanity check: don't start more workers than jobs
+	if concurrency > numRequests {
+		concurrency = numRequests
+	}
 
-	seqReqs := *n - *c
+	// --- Logic for Step 1 & 2 (Simple Report) vs. Step 3+ (Summary Report) ---
+	// The challenge implies simple requests print codes, and load tests print summaries.
+	if numRequests <= 10 && concurrency == 1 {
+		fmt.Println("Running sequential test...")
+		runSequential(urls, numRequests)
+	} else {
+		fmt.Println("Starting load test...")
+		runLoadTest(urls, numRequests, concurrency)
+	}
+}
 
-	metrics := []Metrics{}
+// runSequential fulfills Steps 1 & 2, printing individual response codes.
+func runSequential(urls []string, n int) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	for i := range n {
+		url := urls[i%len(urls)] // Cycle through URLs
+		resp, err := client.Get(url)
+		if err != nil {
+			fmt.Printf("Request error: %v\n", err)
+			continue
+		}
+		fmt.Printf("Response code: %d\n", resp.StatusCode)
+		resp.Body.Close()
+	}
+}
+
+// runLoadTest fulfills Steps 3-6, running a concurrent test and printing a summary.
+func runLoadTest(urls []string, n, c int) {
+	jobs := make(chan string, n)
+	results := make(chan *Metric, n) // Use *Metric to easily signal network errors with 'nil'
 
 	var wg sync.WaitGroup
 
-	for range seqReqs {
-		start := time.Now()
-		resp, err := http.Get(url)
-		end := time.Now()
-		totalTime := end.Sub(start).Seconds() * 1000
-		m := Metrics{requestTime: totalTime}
-		if err != nil {
-			fmt.Println("Request error:", err)
-			return
-		}
-		firstByteTime := time.Now()
-		defer resp.Body.Close()
-
-		io.ReadAll(resp.Body)
-		lastByteTime := time.Now()
-
-		ttfb := firstByteTime.Sub(start).Seconds() * 1000
-		ttlb := lastByteTime.Sub(start).Seconds() * 1000
-
-		m.timeToFirstByte = ttfb
-		m.timeToLastByte = ttlb
-
-		metrics = append(metrics, m)
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			successCount++
-		} else {
-			failureCount++
-		}
+	// Create a reusable HTTP client optimized for concurrency
+	client := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        c,
+			MaxIdleConnsPerHost: c,
+		},
+		Timeout: 15 * time.Second,
 	}
 
-	print("Starting load test...\n")
+	// --- Step 3: Start Workers ---
+	for range c {
+		wg.Add(1)
+		go worker(&wg, client, jobs, results)
+	}
 
-	for i := 0; i < *c; i++ {
-		wg.Go(func() {
-			start := time.Now()
-			resp, err := http.Get(url)
-			end := time.Now()
-			totalTime := end.Sub(start).Seconds() * 1000
-			m := Metrics{requestTime: totalTime}
-			if err != nil {
-				fmt.Println("Request error:", err)
-				return
-			}
-			firstByteTime := time.Now()
-			defer resp.Body.Close()
+	testStart := time.Now()
 
-			io.ReadAll(resp.Body)
-			lastByteTime := time.Now()
+	// --- Feed Jobs ---
+	for i := range n {
+		jobs <- urls[i%len(urls)] // This handles Step 6's "repeat URLs"
+	}
+	close(jobs) // Signal to workers that no more jobs are coming
 
-			ttfb := firstByteTime.Sub(start).Seconds() * 1000
-			ttlb := lastByteTime.Sub(start).Seconds() * 1000
+	// --- Wait and Close Results ---
+	wg.Wait()
+	close(results) // Signal to collector that no more results are coming
 
-			m.timeToFirstByte = ttfb
-			m.timeToLastByte = ttlb
+	testDuration := time.Since(testStart)
 
-			metrics = append(metrics, m)
+	// --- Step 4 & 5: Collect and Analyze Stats ---
+	successCount := 0
+	failureCount := 0
+	ttfbDurations := []time.Duration{}
+	ttlbDurations := []time.Duration{}
 
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	for m := range results {
+		if m == nil {
+			// 'nil' signifies a network-level error (before we got a response)
+			failureCount++
+		} else {
+			// We got a response, so we have metrics
+			ttfbDurations = append(ttfbDurations, m.timeToFirstByte)
+			ttlbDurations = append(ttlbDurations, m.timeToLastByte)
+
+			if m.statusCode >= 200 && m.statusCode < 300 {
 				successCount++
 			} else {
 				failureCount++
 			}
-		})
-	}
-	wg.Wait()
-
-	minReqTime := _minReqTime(metrics)
-	maxReqTime := _maxReqTime(metrics)
-	meanReqTime := _meanReqTime(metrics)
-	minFirstByteTime := _minFirstByteTime(metrics)
-	maxFirstByteTime := _maxFirstByteTime(metrics)
-	meanFirstByteTime := _meanFirstByteTime(metrics)
-	minLastByteTime := _minLastByteTime(metrics)
-	maxLastByteTime := _maxLastByteTime(metrics)
-	meanLastByteTime := _meanLastByteTime(metrics)
-
-	fmt.Printf("Total Requests (2XX)..........................: %d\n", successCount)
-	fmt.Printf("Failed Requests (5XX).........................: %d\n", failureCount)
-	fmt.Printf("Total Requests Per Second.....................: %.2f\n", _totalRequestsPerSecond(metrics))
-	fmt.Printf("Total Request Time (s) (Min, Max, Mean).......: %.2f, %.2f, %.2f ms\n", minReqTime, maxReqTime, meanReqTime)
-	fmt.Printf("Time to First Byte (s) (Min, Max, Mean).......: %.2f, %.2f, %.2f ms\n", minFirstByteTime, maxFirstByteTime, meanFirstByteTime)
-	fmt.Printf("Time to Last Byte (s) (Min, Max, Mean)........: %.2f , %.2f, %.2f ms\n", minLastByteTime, maxLastByteTime, meanLastByteTime)
-
-}
-
-func _totalRequestsPerSecond(metrics []Metrics) float64 {
-	totalTime := 0.0
-
-	for _, r := range metrics {
-		totalTime += r.requestTime
-	}
-
-	reqPerSec := float64(len(metrics)) / (totalTime / 1000)
-	return reqPerSec
-}
-
-func _minReqTime(metrics []Metrics) float64 {
-	var minReqTime float64
-
-	for i, r := range metrics {
-		if i == 0 || r.requestTime < minReqTime {
-			minReqTime = r.requestTime
 		}
 	}
-	return minReqTime
+
+	// --- Calculate final stats ---
+	minTTFB, maxTTFB, meanTTFB := analyzeDurations(ttfbDurations)
+	minTTLB, maxTTLB, meanTTLB := analyzeDurations(ttlbDurations)
+	reqPerSec := float64(n) / testDuration.Seconds()
+
+	// --- Print Report ---
+	fmt.Println("\nResults:")
+	fmt.Printf(" Total Requests (2XX)..........................: %d\n", successCount)
+	fmt.Printf(" Failed Requests (non-2XX or network error)....: %d\n", failureCount)
+	fmt.Printf(" Total Requests Per Second.....................: %.2f\n", reqPerSec)
+	fmt.Printf("Total Request Time (s) (Min, Max, Mean).......: %.2f, %.2f, %.2f ms\n", minTTLB, maxTTLB, meanTTLB)
+	fmt.Printf("Time to First Byte (s) (Min, Max, Mean).......: %.2f, %.2f, %.2f ms\n", minTTFB, maxTTFB, meanTTFB)
+	fmt.Printf("Time to Last Byte (s) (Min, Max, Mean)........: %.2f, %.2f, %.2f ms\n", minTTLB, maxTTLB, meanTTLB)
 }
 
-func _maxReqTime(metrics []Metrics) float64 {
-	var maxReqTime float64
+// worker is the goroutine that performs the HTTP requests.
+// It receives URLs from 'jobs' and sends Metrics (or nil) to 'results'.
+func worker(wg *sync.WaitGroup, client *http.Client, jobs <-chan string, results chan<- *Metric) {
+	defer wg.Done()
+	for url := range jobs {
+		start := time.Now()
+		resp, err := client.Get(url)
+		if err != nil {
+			// Network error (e.g., connection refused, DNS lookup failed)
+			results <- nil // Send nil to signal failure
+			continue
+		}
+		ttfb := time.Since(start) // This is the true Time to First Byte
 
-	for i, r := range metrics {
-		if i == 0 || r.requestTime > maxReqTime {
-			maxReqTime = r.requestTime
+		// Ensure the body is read and closed to reuse the connection
+		// This is critical for accurate load testing.
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		ttlb := time.Since(start) // This is the true Time to Last Byte (Total Time)
+
+		if err != nil {
+			// Body read error
+			results <- nil // Count as failure
+			continue
+		}
+
+		results <- &Metric{
+			timeToFirstByte: ttfb,
+			timeToLastByte:  ttlb,
+			statusCode:      resp.StatusCode,
 		}
 	}
-	return maxReqTime
 }
 
-func _meanReqTime(metrics []Metrics) float64 {
-	var totalReqTime float64
-
-	for _, r := range metrics {
-		totalReqTime += r.requestTime
+// getURLs figures out the list of URLs to test based on flags.
+func getURLs(fileFlag, urlFlag string, args []string) ([]string, error) {
+	if fileFlag != "" {
+		return readLines(fileFlag)
 	}
-	meanReqTime := totalReqTime / float64(len(metrics))
-	return meanReqTime
+	if urlFlag != "" {
+		return []string{urlFlag}, nil
+	}
+	if len(args) > 0 {
+		return []string{args[0]}, nil
+	}
+	return nil, fmt.Errorf("no URL provided. Use -u, -f, or a command-line argument")
 }
 
-func _minFirstByteTime(metrics []Metrics) float64 {
-	var minFirstByteTime float64
+// readLines (for -f flag) reads a file line by line into a string slice.
+func readLines(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
 
-	for i, r := range metrics {
-		if i == 0 || r.timeToFirstByte < minFirstByteTime {
-			minFirstByteTime = r.timeToFirstByte
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	return lines, scanner.Err()
+}
+
+// analyzeDurations calculates Min, Max, and Mean for a slice of durations.
+// Returns all values in milliseconds (ms).
+func analyzeDurations(durations []time.Duration) (minMs, maxMs, meanMs float64) {
+	if len(durations) == 0 {
+		return 0, 0, 0
+	}
+
+	minVal := durations[0]
+	maxVal := durations[0]
+	var totalVal time.Duration
+
+	for _, d := range durations {
+		if d < minVal {
+			minVal = d
 		}
-	}
-	return minFirstByteTime
-}
-
-func _maxFirstByteTime(metrics []Metrics) float64 {
-	var maxFirstByteTime float64
-
-	for i, r := range metrics {
-		if i == 0 || r.timeToFirstByte > maxFirstByteTime {
-			maxFirstByteTime = r.timeToFirstByte
+		if d > maxVal {
+			maxVal = d
 		}
+		totalVal += d
 	}
-	return maxFirstByteTime
-}
 
-func _meanFirstByteTime(metrics []Metrics) float64 {
-	var totalFirstByteTime float64
+	// Convert to ms for reporting
+	// Use .Microseconds() for float64 precision
+	minMs = float64(minVal.Microseconds()) / 1000.0
+	maxMs = float64(maxVal.Microseconds()) / 1000.0
+	meanMs = (float64(totalVal.Microseconds()) / 1000.0) / float64(len(durations))
 
-	for _, r := range metrics {
-		totalFirstByteTime += r.timeToFirstByte
-	}
-	meanFirstByteTime := totalFirstByteTime / float64(len(metrics))
-	return meanFirstByteTime
-}
-
-func _minLastByteTime(metrics []Metrics) float64 {
-	var minLastByteTime float64
-
-	for i, r := range metrics {
-		if i == 0 || r.timeToLastByte < minLastByteTime {
-			minLastByteTime = r.timeToLastByte
-		}
-	}
-	return minLastByteTime
-}
-
-func _maxLastByteTime(metrics []Metrics) float64 {
-	var maxLastByteTime float64
-	for i, r := range metrics {
-		if i == 0 || r.timeToLastByte > maxLastByteTime {
-			maxLastByteTime = r.timeToLastByte
-		}
-	}
-	return maxLastByteTime
-}
-
-func _meanLastByteTime(metrics []Metrics) float64 {
-	var totalLastByteTime float64
-
-	for _, r := range metrics {
-		totalLastByteTime += r.timeToLastByte
-	}
-	meanLastByteTime := totalLastByteTime / float64(len(metrics))
-	return meanLastByteTime
+	return
 }
